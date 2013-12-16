@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# vim: set ft=ruby:
+
+# The preamble here is stolen from @garybernhardt's selecta script and is a
+# workaround to get a single-file ruby script to start as quickly as possible.
+#
+# This file executes as a bash script, which turns around and executes Ruby via
+# the line below. The -x argument to Ruby makes it discard everything before
+# the second "!ruby" shebang. This allows us to work on Linux, where the
+# shebang can only have one argument so we can't directly say
+# "#!/usr/bin/env ruby --disable-gems". Thanks for that, Linux.
+#
+# If this seems confusing, don't worry. You can treat it as a normal Ruby file
+# starting with the "!ruby" shebang below.
+
+exec /usr/bin/env ruby --disable-gems -x "$0" $*
+#!ruby
+
+if RUBY_VERSION < '1.9.3'
+  abort "error: diredit requires Ruby 1.9.3 or higher."
+end
+
+require "etc"
+require "fcntl"
+require "optparse"
+require "io/console"
+require "scanf"
+require "tempfile"
+
+class Diredit
+
+  def main
+
+    # check whether we have STDIN input available
+    # http://footle.org/2008/08/21/checking-for-stdin-inruby/
+    has_stdin = STDIN.fcntl(Fcntl::F_GETFL, 0) == 0
+
+    # check whether we're outputting in a pipeline
+    has_stdout = STDOUT.fcntl(Fcntl::F_GETFL, 0) == 1
+
+    options = Configuration.parse_options(ARGV, :interactive => (not has_stdin and not has_stdout))
+
+    if ARGV.length == 0
+      ARGV << "."
+      options[:recursive] = true if has_stdin # simplifies use in pipeline
+    end
+
+    dirs = Directories.list(ARGV, options)
+
+    if options[:interactive]
+
+      file = Tempfile.new('diredit')
+      begin
+
+        file.write dirs.string
+        file.flush
+
+        editor = ENV.fetch('EDITOR', '/usr/bin/vi')
+        system editor, file.path
+
+        file.open
+        dirs.apply Commands.parse(file.readlines)
+
+      ensure
+        file.close()
+        file.unlink()
+      end
+
+    elsif has_stdin
+      dirs.apply Commands.parse($stdin.readlines)
+    else
+      puts dirs.string
+    end
+
+  end
+
+end
+
+class Configuration
+
+  def self.parse_options(argv, options = {})
+    default_options = {
+      :interactive => true,
+      :recursive => false,
+      :verbose => false,
+    }
+    options = default_options.merge(options)
+
+    parser = OptionParser.new do |opts|
+      opts.banner = "Usage: #{$PROGRAM_NAME} [options] [path]"
+
+      opts.on("-h", "--help", "Show this message") do |v|
+        puts opts
+        exit
+      end
+
+      opts.on("-i", "--interactive", "Launch $EDITOR to interactively edit directory listing (default unless stdin and stdout are redirected)") do
+        options[:interactive] = true
+      end
+      opts.on("-p", "--non-interactive", "Print listing instead of editing interactively (default when stdin or stdout are directed to a file or pipe)") do
+        options[:interactive] = false
+      end
+
+      opts.on("-r", "--recursive", "List recursively") do
+        options[:recursive] = true
+      end
+
+      opts.on("-v", "--verbose", "Print every change as it is applied") do
+        options[:verbose] = true
+      end
+    end
+
+    begin
+      parser.parse!(argv)
+    rescue OptionParser::InvalidOption => e
+      $stderr.puts e
+      $stderr.puts parser
+      exit 1
+    end
+
+    options
+  end
+end
+
+class Directories
+
+  def initialize(dirs, options = {})
+    @dirs = dirs
+    @options = options
+  end
+
+  def string
+    out = []
+    @dirs.each do |dir|
+      out << "# " + dir.name if @options[:verbose] or @options[:interactive]
+      out << dir.string
+    end
+    out.join("\n")
+  end
+
+  def apply(commands)
+    commands.each do |key, command|
+      @dirs.each do |dir|
+        if dir.apply(command, @options.fetch(:verbose, false))
+          commands.delete key
+          break
+        end
+      end
+    end
+  end
+
+  def self.list(paths, options)
+    dirs = paths.map { |path| FileList.list path, options }
+    self.new dirs, options
+  end
+
+end
+
+class Commands
+
+  def self.parse(lines)
+    commands = {}
+    lines.each do |line|
+      line.match(/^\s*(?<ino>[a-f0-9]+)\b\s*(?<rest>(?:(?<mode>[0-9]+)\s+(?<user>[^\s]+)\s+(?<group>[^\s]+)\s+(?<filename>.+?))?)\s*$/) do |m|
+        if m[:rest].empty?
+          commands[m[:ino]] = DeleteCommand.new(m[:ino])
+        else
+          commands[m[:ino]] = UpdateCommand.new(m[:ino], ParsesFileInfo.new(m[:mode], m[:user], m[:group], m[:filename]))
+        end
+      end
+    end
+    commands
+  end
+
+end
+
+class FileList
+
+  attr_reader :name
+
+  def initialize(name, files)
+    @name = name
+    @files = {}
+    files.each do |file_info|
+      @files[file_info.inode] = file_info
+    end
+  end
+
+  def string
+    out = @files.values.map do |file|
+      sprintf("%s %s %s %s %s", file.inode, file.mode, file.user, file.group, file.filename)
+    end
+    out.join("\n")
+  end
+
+  def apply(command, verbose = false)
+    @files.each do |file|
+      file = @files[command.inode]
+      if file
+        command.apply_to file, verbose
+        return true
+      end
+    end
+  end
+
+  def self.list(path, options)
+    glob_path = File.join(path, '**')
+    glob_path = File.join(glob_path, '**') if options[:recursive]
+    files = Dir.glob(glob_path).map do |filename|
+      filename = filename[2...filename.length] if filename.start_with? "./"
+      stat = File.stat(filename)
+      FileInfo.new(stat, filename)
+    end
+    self.new(path, files)
+  end
+
+end
+
+class FileInfo < Struct.new(:stat, :filename)
+  def inode
+    sprintf "%x", stat.ino
+  end
+
+  def mode
+    sprintf "%6o", stat.mode
+  end
+
+  def user
+    Etc.getpwuid(stat.uid).name
+  end
+
+  def group
+    Etc.getgrgid(stat.gid).name
+  end
+end
+
+class ParsesFileInfo < Struct.new(:mode_string, :user, :group, :filename)
+  def mode
+    mode_string.scanf("%o").shift
+  end
+
+  def uid
+    Etc.getpwnam(user).uid
+  end
+
+  def gid
+    Etc.getgrnam(group).gid
+  end
+end
+
+class UpdateCommand < Struct.new(:inode, :info)
+  def apply_to(file, verbose = false)
+    if info.mode_string != file.mode
+      File.chmod info.mode, file.filename
+      puts "chmod " + info.mode_string + " " + file.filename if verbose
+    end
+    if info.user != file.user
+      File.chown info.uid, file.filename
+      puts "chown " + info.user + " " + file.filename if verbose
+    end
+    if info.group != file.group
+      File.chgrp info.gid, file.filename
+      puts "chgrp " + info.group + " " + file.filename if verbose
+    end
+    if info.filename != file.filename
+      File.rename file.filename, info.filename
+      puts "mv " + file.filename + " " + info.filename if verbose
+    end
+  end
+end
+
+class DeleteCommand < Struct.new(:inode)
+  def apply_to(file, verbose = false)
+    File.delete file.filename
+    puts "rm -f " + file.filename if verbose
+  end
+end
+
+if $0 == __FILE__
+  begin
+    Diredit.new.main
+  rescue SystemExit, Interrupt
+    exit(1)
+  end
+end
+
