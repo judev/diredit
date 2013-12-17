@@ -20,6 +20,7 @@ if RUBY_VERSION < '1.9.3'
   abort "error: diredit requires Ruby 1.9.3 or higher."
 end
 
+require "date"
 require "etc"
 require "fcntl"
 require "optparse"
@@ -161,11 +162,11 @@ class Commands
   def self.parse(lines)
     commands = {}
     lines.each do |line|
-      line.match(/^\s*(?<ino>[a-f0-9]+)\b\s*(?<rest>(?:(?<mode>[0-9]+)\s+(?<user>[^\s]+)\s+(?<group>[^\s]+)\s+(?<filename>.+?))?)\s*$/) do |m|
+      line.match(/^\s*(?<ino>[a-f0-9]+)\b\s*(?<rest>(?:(?<mode>[0-9]+)\s+(?<user>[^\s]+)\s+(?<group>[^\s]+)\s+(?<datetime>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2})\s+(?<filename>.+?))?)\s*$/) do |m|
         if m[:rest].empty?
           commands[m[:ino]] = DeleteCommand.new(m[:ino])
         else
-          commands[m[:ino]] = UpdateCommand.new(m[:ino], ParsesFileInfo.new(m[:mode], m[:user], m[:group], m[:filename]))
+          commands[m[:ino]] = UpdateCommand.new(m[:ino], ParsesFileInfo.new(m[:mode], m[:user], m[:group], m[:datetime], m[:filename]))
         end
       end
     end
@@ -188,7 +189,7 @@ class FileList
 
   def string
     out = @files.values.map do |file|
-      sprintf("%s %s %s %s %s", file.inode, file.mode, file.user, file.group, file.filename)
+      sprintf("%s %s %s %s %s %s", file.inode, file.mode, file.user, file.group, file.mtime, file.filename)
     end
     out.join("\n")
   end
@@ -225,6 +226,10 @@ class FileInfo < Struct.new(:stat, :filename)
     sprintf "%6o", stat.mode
   end
 
+  def mtime
+    stat.mtime.strftime('%FT%T%:z')
+  end
+
   def user
     Etc.getpwuid(stat.uid).name
   end
@@ -234,9 +239,13 @@ class FileInfo < Struct.new(:stat, :filename)
   end
 end
 
-class ParsesFileInfo < Struct.new(:mode_string, :user, :group, :filename)
+class ParsesFileInfo < Struct.new(:mode_string, :user, :group, :datetime, :filename)
   def mode
     mode_string.scanf("%o").shift
+  end
+
+  def mtime
+    DateTime.strptime(datetime, '%FT%T%:z').to_time
   end
 
   def uid
@@ -253,6 +262,11 @@ class UpdateCommand < Struct.new(:inode, :info)
     if info.mode_string != file.mode
       File.chmod info.mode, file.filename
       puts "chmod " + info.mode_string + " " + file.filename if verbose
+    end
+    if info.datetime != file.mtime
+      mtime = info.mtime
+      File.utime(File.atime(file.filename), mtime, file.filename)
+      puts "touch -m -t " + mtime.strftime("%Y%m%d%H%M.%S") + " " + file.filename if verbose
     end
     if info.user != file.user
       File.chown info.uid, file.filename
