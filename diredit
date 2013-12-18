@@ -54,6 +54,7 @@ class Diredit
       begin
 
         file.write dirs.string
+        file.write "\n" + help_text
         file.flush
 
         editor = ENV.fetch('EDITOR', '/usr/bin/vi')
@@ -75,6 +76,14 @@ class Diredit
 
   end
 
+  def help_text
+    <<EOT
+# Empty lines and lines beginning with '#' are ignored.
+# Do not edit the first column.
+# Editing any of the other columns will cause those changes to be made once you save and quit.
+# To delete a file remove everything on the line except the first column.
+EOT
+  end
 end
 
 class Configuration
@@ -133,7 +142,7 @@ class Directories
   def string
     out = []
     @dirs.each do |dir|
-      out << "# " + dir.name if @options[:verbose] or @options[:interactive]
+      out << "# Path: " + dir.name if @options[:verbose] or @options[:interactive]
       out << dir.string
     end
     out.join("\n")
