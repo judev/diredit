@@ -10,8 +10,8 @@ describe UpdateCommand do
       ]),
     ])
     commands = Commands.parse([
-      "abc123 100644 user group /tmp/example.txt",
-      "abc124 100644 user group /tmp/example2.txt",
+      "abc123 100644 user group 2014-04-30T10:11:12+01:00 /tmp/example.txt",
+      "abc124 100644 user group 2014-04-30T10:11:12+01:00 /tmp/example2.txt",
     ])
     allow(commands["abc123"]).to receive(:apply_to) { |file, verbose| }
     allow(commands["abc124"]).to receive(:apply_to) { |file, verbose| }
