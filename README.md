@@ -24,5 +24,5 @@ diredit ./tmp/ | sed 's/\.txt$/\.md/' | diredit
 
 make files group-writable
 ```
-diredit ./tmp/ | sed 's/100644/100664/' | diredit
+diredit ./tmp/ | sed 's/ 100644/ 100664/' | diredit
 ```
