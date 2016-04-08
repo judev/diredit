@@ -50,7 +50,7 @@ class Diredit
 
     if options[:interactive]
 
-      file = Tempfile.new('diredit')
+      file = Tempfile.new(['diredit', '.diredit'])
       begin
 
         file.write dirs.string
