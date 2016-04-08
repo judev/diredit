@@ -78,10 +78,10 @@ class Diredit
 
   def help_text
     <<EOT
-# Empty lines and lines beginning with '#' are ignored.
-# Do not edit the first column.
-# Editing any of the other columns will cause those changes to be made once you save and quit.
-# To delete a file remove everything on the line except the first column.
+## Empty lines and lines beginning with '#' are ignored.
+## Do not edit the first column.
+## Editing any of the other columns will cause those changes to be made once you save and quit.
+## To delete a file remove everything on the line except the first column.
 EOT
   end
 end
