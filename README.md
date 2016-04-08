@@ -26,3 +26,7 @@ make files group-writable
 ```
 diredit ./tmp/ | sed 's/ 100644/ 100664/' | diredit
 ```
+
+## vim integration
+
+Running ```diredit``` directly will launch your ```$EDITOR``` anyway, but the [vim-diredit](https://github.com/judev/vim-diredit) makes it a little nicer by hiding the inode column.
