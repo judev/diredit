@@ -1,8 +1,2 @@
 .DS_Store
-/tmp
-/.ruby-version
-/.ruby-gemset
-
-# Added by cargo
-
 /target
