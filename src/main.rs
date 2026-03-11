@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::env;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
+use std::fmt;
 use std::fs;
 use std::io::{self, BufRead, IsTerminal};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
@@ -31,49 +32,35 @@ fn groupname_from_gid(gid: u32) -> String {
 }
 
 fn uid_from_username(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
+    let c_name = CString::new(name).ok()?;
     unsafe {
         let pw = libc::getpwnam(c_name.as_ptr());
-        if pw.is_null() {
-            None
-        } else {
-            Some((*pw).pw_uid)
-        }
+        if pw.is_null() { None } else { Some((*pw).pw_uid) }
     }
 }
 
 fn gid_from_groupname(name: &str) -> Option<u32> {
-    let c_name = std::ffi::CString::new(name).ok()?;
+    let c_name = CString::new(name).ok()?;
     unsafe {
         let gr = libc::getgrnam(c_name.as_ptr());
-        if gr.is_null() {
-            None
-        } else {
-            Some((*gr).gr_gid)
-        }
+        if gr.is_null() { None } else { Some((*gr).gr_gid) }
     }
 }
 
 // --- Time formatting/parsing (ISO 8601 with timezone offset) ---
 
-/// Format a SystemTime as ISO 8601 local time with UTC offset: 2014-04-30T10:11:12+01:00
 fn format_mtime(mtime: SystemTime) -> String {
-    let duration = mtime
+    let secs = mtime
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let secs = duration.as_secs() as i64;
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
 
-    // Use libc to get local time with timezone
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::localtime_r(&secs as *const i64, &mut tm);
-    }
+    unsafe { libc::localtime_r(&secs, &mut tm) };
 
     let offset_secs = tm.tm_gmtoff;
     let offset_sign = if offset_secs >= 0 { '+' } else { '-' };
     let offset_abs = offset_secs.unsigned_abs() as u64;
-    let offset_hours = offset_abs / 3600;
-    let offset_mins = (offset_abs % 3600) / 60;
 
     format!(
         "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{}{:02}:{:02}",
@@ -84,12 +71,11 @@ fn format_mtime(mtime: SystemTime) -> String {
         tm.tm_min,
         tm.tm_sec,
         offset_sign,
-        offset_hours,
-        offset_mins,
+        offset_abs / 3600,
+        (offset_abs % 3600) / 60,
     )
 }
 
-/// Parse an ISO 8601 datetime string like "2014-04-30T10:11:12+01:00" into a SystemTime.
 fn parse_datetime(s: &str) -> Option<SystemTime> {
     if s.len() < 25 {
         return None;
@@ -111,7 +97,6 @@ fn parse_datetime(s: &str) -> Option<SystemTime> {
         _ => return None,
     };
 
-    // Convert to UTC timestamp
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     tm.tm_year = year - 1900;
     tm.tm_mon = month - 1;
@@ -121,7 +106,6 @@ fn parse_datetime(s: &str) -> Option<SystemTime> {
     tm.tm_sec = sec;
     tm.tm_isdst = -1;
 
-    // timegm treats the fields as UTC, then we subtract the offset
     let epoch = unsafe { libc::timegm(&mut tm) };
     if epoch == -1 {
         return None;
@@ -134,16 +118,15 @@ fn parse_datetime(s: &str) -> Option<SystemTime> {
     Some(SystemTime::UNIX_EPOCH + Duration::from_secs(utc_secs as u64))
 }
 
-/// Format SystemTime for touch-style verbose output
 fn format_touch_time(mtime: SystemTime) -> String {
-    let duration = mtime
+    let secs = mtime
         .duration_since(SystemTime::UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    let secs = duration.as_secs() as i64;
+        .unwrap_or(Duration::ZERO)
+        .as_secs() as i64;
+
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
-    unsafe {
-        libc::localtime_r(&secs as *const i64, &mut tm);
-    }
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+
     format!(
         "{:04}{:02}{:02}{:02}{:02}.{:02}",
         tm.tm_year + 1900,
@@ -155,10 +138,37 @@ fn format_touch_time(mtime: SystemTime) -> String {
     )
 }
 
+// --- Libc helper ---
+
+fn libc_chown(c_path: &CStr, uid: u32, gid: u32) -> io::Result<()> {
+    let ret = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+    if ret != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+fn set_mtime(c_path: &CStr, mtime: SystemTime) -> io::Result<()> {
+    let duration = mtime
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    let times = [
+        libc::timespec { tv_sec: 0, tv_nsec: libc::UTIME_OMIT },
+        libc::timespec { tv_sec: duration.as_secs() as libc::time_t, tv_nsec: 0 },
+    ];
+    let ret = unsafe { libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0) };
+    if ret != 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
 // --- Core data structures ---
 
 struct FileInfo {
-    inode: u64,
+    inode_hex: String,
     mode: u32,
     uid: u32,
     gid: u32,
@@ -167,10 +177,6 @@ struct FileInfo {
 }
 
 impl FileInfo {
-    fn inode_hex(&self) -> String {
-        format!("{:x}", self.inode)
-    }
-
     fn mode_octal(&self) -> String {
         format!("{:6o}", self.mode)
     }
@@ -186,11 +192,14 @@ impl FileInfo {
     fn mtime_string(&self) -> String {
         format_mtime(self.mtime)
     }
+}
 
-    fn format_line(&self) -> String {
-        format!(
+impl fmt::Display for FileInfo {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
             "{} {} {} {} {} {}",
-            self.inode_hex(),
+            self.inode_hex,
             self.mode_octal(),
             self.username(),
             self.groupname(),
@@ -202,57 +211,32 @@ impl FileInfo {
 
 struct FileList {
     name: String,
-    files: HashMap<String, FileInfo>,
+    files: Vec<FileInfo>,
 }
 
 impl FileList {
-    fn new(name: String, files: Vec<FileInfo>) -> Self {
-        let mut map = HashMap::new();
-        for f in files {
-            map.insert(f.inode_hex(), f);
-        }
-        FileList { name, files: map }
-    }
-
-    fn to_string_repr(&self) -> String {
-        self.files
-            .values()
-            .map(|f| f.format_line())
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    fn apply(&self, command: &dyn Command, verbose: bool) -> bool {
-        if let Some(file) = self.files.get(&command.inode()) {
-            command.apply_to(file, verbose);
-            return true;
-        }
-        false
+    fn find(&self, inode: &str) -> Option<&FileInfo> {
+        self.files.iter().find(|f| f.inode_hex == inode)
     }
 
     fn list(path: &str, recursive: bool) -> io::Result<Self> {
         let mut files = Vec::new();
         Self::collect_files(Path::new(path), recursive, &mut files)?;
-        Ok(FileList::new(path.to_string(), files))
+        Ok(FileList { name: path.to_string(), files })
     }
 
-    fn collect_files(
-        dir: &Path,
-        recursive: bool,
-        files: &mut Vec<FileInfo>,
-    ) -> io::Result<()> {
+    fn collect_files(dir: &Path, recursive: bool, files: &mut Vec<FileInfo>) -> io::Result<()> {
         for entry in fs::read_dir(dir)? {
             let entry = entry?;
             let metadata = entry.metadata()?;
             let mut filename = entry.path().to_string_lossy().into_owned();
 
-            // Strip leading "./" like the Ruby version
             if filename.starts_with("./") {
                 filename = filename[2..].to_string();
             }
 
             files.push(FileInfo {
-                inode: metadata.ino(),
+                inode_hex: format!("{:x}", metadata.ino()),
                 mode: metadata.mode(),
                 uid: metadata.uid(),
                 gid: metadata.gid(),
@@ -268,38 +252,31 @@ impl FileList {
     }
 }
 
+impl fmt::Display for FileList {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, file) in self.files.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            write!(f, "{file}")?;
+        }
+        Ok(())
+    }
+}
+
 struct Directories {
     dirs: Vec<FileList>,
-    verbose: bool,
-    interactive: bool,
+    show_paths: bool,
 }
 
 impl Directories {
-    fn new(dirs: Vec<FileList>, verbose: bool, interactive: bool) -> Self {
-        Directories {
-            dirs,
-            verbose,
-            interactive,
-        }
-    }
-
-    fn to_string_repr(&self) -> String {
-        let mut parts = Vec::new();
-        for dir in &self.dirs {
-            if self.verbose || self.interactive {
-                parts.push(format!("# Path: {}", dir.name));
-            }
-            parts.push(dir.to_string_repr());
-        }
-        parts.join("\n")
-    }
-
-    fn apply(&self, commands: &mut HashMap<String, Box<dyn Command>>, verbose: bool) {
+    fn apply(&self, commands: &mut HashMap<String, Command>, verbose: bool) {
         let keys: Vec<String> = commands.keys().cloned().collect();
         for key in keys {
             for dir in &self.dirs {
-                if let Some(cmd) = commands.get(&key) {
-                    if dir.apply(cmd.as_ref(), verbose) {
+                if let Some(file) = dir.find(&key) {
+                    if let Some(cmd) = commands.get(&key) {
+                        cmd.apply_to(file, verbose);
                         commands.remove(&key);
                         break;
                     }
@@ -308,173 +285,113 @@ impl Directories {
         }
     }
 
-    fn list(paths: &[String], recursive: bool, verbose: bool, interactive: bool) -> Self {
+    fn list(paths: &[String], recursive: bool, show_paths: bool) -> Self {
         let dirs: Vec<FileList> = paths
             .iter()
             .filter_map(|p| match FileList::list(p, recursive) {
                 Ok(fl) => Some(fl),
                 Err(e) => {
-                    eprintln!("diredit: {}: {}", p, e);
+                    eprintln!("diredit: {p}: {e}");
                     None
                 }
             })
             .collect();
-        Self::new(dirs, verbose, interactive)
+        Directories { dirs, show_paths }
+    }
+}
+
+impl fmt::Display for Directories {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, dir) in self.dirs.iter().enumerate() {
+            if i > 0 {
+                writeln!(f)?;
+            }
+            if self.show_paths {
+                writeln!(f, "# Path: {}", dir.name)?;
+            }
+            write!(f, "{dir}")?;
+        }
+        Ok(())
     }
 }
 
 // --- Commands ---
 
-trait Command {
-    fn inode(&self) -> String;
-    fn apply_to(&self, file: &FileInfo, verbose: bool);
+enum Command {
+    Delete,
+    Update {
+        mode: u32,
+        user: String,
+        group: String,
+        datetime: String,
+        mtime: SystemTime,
+        filename: String,
+    },
 }
 
-struct DeleteCommand {
-    ino: String,
-}
-
-impl Command for DeleteCommand {
-    fn inode(&self) -> String {
-        self.ino.clone()
-    }
-
+impl Command {
     fn apply_to(&self, file: &FileInfo, verbose: bool) {
-        if let Err(e) = fs::remove_file(&file.filename) {
-            eprintln!("diredit: rm {}: {}", file.filename, e);
-        } else if verbose {
-            println!("rm -f {}", file.filename);
-        }
-    }
-}
-
-struct UpdateCommand {
-    ino: String,
-    mode_string: String,
-    user: String,
-    group: String,
-    datetime: String,
-    filename: String,
-}
-
-impl UpdateCommand {
-    fn parsed_mode(&self) -> Option<u32> {
-        u32::from_str_radix(self.mode_string.trim(), 8).ok()
-    }
-
-    fn parsed_mtime(&self) -> Option<SystemTime> {
-        parse_datetime(&self.datetime)
-    }
-}
-
-impl Command for UpdateCommand {
-    fn inode(&self) -> String {
-        self.ino.clone()
-    }
-
-    fn apply_to(&self, file: &FileInfo, verbose: bool) {
-        // chmod
-        if self.mode_string.trim() != file.mode_octal().trim() {
-            if let Some(mode) = self.parsed_mode() {
-                if let Err(e) =
-                    fs::set_permissions(&file.filename, fs::Permissions::from_mode(mode))
-                {
-                    eprintln!("diredit: chmod {}: {}", file.filename, e);
+        match self {
+            Command::Delete => {
+                if let Err(e) = fs::remove_file(&file.filename) {
+                    eprintln!("diredit: rm {}: {e}", file.filename);
                 } else if verbose {
-                    println!("chmod {} {}", self.mode_string.trim(), file.filename);
+                    println!("rm -f {}", file.filename);
                 }
             }
-        }
-
-        // touch (mtime)
-        if self.datetime != file.mtime_string() {
-            if let Some(new_mtime) = self.parsed_mtime() {
-                let c_path = match std::ffi::CString::new(file.filename.as_bytes()) {
+            Command::Update { mode, user, group, datetime, mtime, filename, .. } => {
+                let c_path = match CString::new(file.filename.as_bytes()) {
                     Ok(p) => p,
                     Err(_) => return,
                 };
-                let duration = new_mtime
-                    .duration_since(SystemTime::UNIX_EPOCH)
-                    .unwrap_or(Duration::ZERO);
-                let times = [
-                    libc::timespec {
-                        tv_sec: 0,
-                        tv_nsec: libc::UTIME_OMIT,
-                    }, // atime: keep unchanged
-                    libc::timespec {
-                        tv_sec: duration.as_secs() as libc::time_t,
-                        tv_nsec: 0,
-                    }, // mtime
-                ];
-                let ret = unsafe {
-                    libc::utimensat(libc::AT_FDCWD, c_path.as_ptr(), times.as_ptr(), 0)
-                };
-                if ret != 0 {
-                    eprintln!(
-                        "diredit: touch {}: {}",
-                        file.filename,
-                        io::Error::last_os_error()
-                    );
-                } else if verbose {
-                    println!(
-                        "touch -m -t {} {}",
-                        format_touch_time(new_mtime),
-                        file.filename
-                    );
-                }
-            }
-        }
 
-        // chown
-        if self.user != file.username() {
-            if let Some(new_uid) = uid_from_username(&self.user) {
-                let c_path = match std::ffi::CString::new(file.filename.as_bytes()) {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                let ret = unsafe { libc::chown(c_path.as_ptr(), new_uid, u32::MAX) };
-                if ret != 0 {
-                    eprintln!(
-                        "diredit: chown {}: {}",
-                        file.filename,
-                        io::Error::last_os_error()
-                    );
-                } else if verbose {
-                    println!("chown {} {}", self.user, file.filename);
+                if *mode != file.mode {
+                    match fs::set_permissions(&file.filename, fs::Permissions::from_mode(*mode)) {
+                        Err(e) => eprintln!("diredit: chmod {}: {e}", file.filename),
+                        Ok(()) if verbose => println!("chmod {:o} {}", mode, file.filename),
+                        _ => {}
+                    }
                 }
-            } else {
-                eprintln!("diredit: unknown user: {}", self.user);
-            }
-        }
 
-        // chgrp
-        if self.group != file.groupname() {
-            if let Some(new_gid) = gid_from_groupname(&self.group) {
-                let c_path = match std::ffi::CString::new(file.filename.as_bytes()) {
-                    Ok(p) => p,
-                    Err(_) => return,
-                };
-                let ret = unsafe { libc::chown(c_path.as_ptr(), u32::MAX, new_gid) };
-                if ret != 0 {
-                    eprintln!(
-                        "diredit: chgrp {}: {}",
-                        file.filename,
-                        io::Error::last_os_error()
-                    );
-                } else if verbose {
-                    println!("chgrp {} {}", self.group, file.filename);
+                if *datetime != file.mtime_string() {
+                    match set_mtime(&c_path, *mtime) {
+                        Err(e) => eprintln!("diredit: touch {}: {e}", file.filename),
+                        Ok(()) if verbose => {
+                            println!("touch -m -t {} {}", format_touch_time(*mtime), file.filename);
+                        }
+                        _ => {}
+                    }
                 }
-            } else {
-                eprintln!("diredit: unknown group: {}", self.group);
-            }
-        }
 
-        // rename
-        if self.filename != file.filename {
-            if let Err(e) = fs::rename(&file.filename, &self.filename) {
-                eprintln!("diredit: mv {} {}: {}", file.filename, self.filename, e);
-            } else if verbose {
-                println!("mv {} {}", file.filename, self.filename);
+                if *user != file.username() {
+                    match uid_from_username(user) {
+                        None => eprintln!("diredit: unknown user: {user}"),
+                        Some(uid) => match libc_chown(&c_path, uid, u32::MAX) {
+                            Err(e) => eprintln!("diredit: chown {}: {e}", file.filename),
+                            Ok(()) if verbose => println!("chown {user} {}", file.filename),
+                            _ => {}
+                        },
+                    }
+                }
+
+                if *group != file.groupname() {
+                    match gid_from_groupname(group) {
+                        None => eprintln!("diredit: unknown group: {group}"),
+                        Some(gid) => match libc_chown(&c_path, u32::MAX, gid) {
+                            Err(e) => eprintln!("diredit: chgrp {}: {e}", file.filename),
+                            Ok(()) if verbose => println!("chgrp {group} {}", file.filename),
+                            _ => {}
+                        },
+                    }
+                }
+
+                if *filename != file.filename {
+                    match fs::rename(&file.filename, filename) {
+                        Err(e) => eprintln!("diredit: mv {} {filename}: {e}", file.filename),
+                        Ok(()) if verbose => println!("mv {} {filename}", file.filename),
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -482,93 +399,41 @@ impl Command for UpdateCommand {
 
 // --- Parsing ---
 
-fn parse_commands(lines: &[String]) -> HashMap<String, Box<dyn Command>> {
-    let mut commands: HashMap<String, Box<dyn Command>> = HashMap::new();
-
+fn parse_commands(lines: &[String]) -> HashMap<String, Command> {
+    let mut commands = HashMap::new();
     for line in lines {
-        if let Some(parsed) = parse_line(line) {
-            match parsed {
-                ParsedLine::Delete(ino) => {
-                    commands.insert(ino.clone(), Box::new(DeleteCommand { ino }));
-                }
-                ParsedLine::Update {
-                    ino,
-                    mode,
-                    user,
-                    group,
-                    datetime,
-                    filename,
-                } => {
-                    commands.insert(
-                        ino.clone(),
-                        Box::new(UpdateCommand {
-                            ino,
-                            mode_string: mode,
-                            user,
-                            group,
-                            datetime,
-                            filename,
-                        }),
-                    );
-                }
-            }
+        if let Some((inode, cmd)) = parse_line(line) {
+            commands.insert(inode, cmd);
         }
     }
-
     commands
 }
 
-enum ParsedLine {
-    Delete(String),
-    Update {
-        ino: String,
-        mode: String,
-        user: String,
-        group: String,
-        datetime: String,
-        filename: String,
-    },
-}
-
-/// Parse a single line matching the Ruby regex pattern.
-fn parse_line(line: &str) -> Option<ParsedLine> {
+/// Parse a single line, returning the inode key and command.
+fn parse_line(line: &str) -> Option<(String, Command)> {
     let trimmed = line.trim();
 
-    // Skip comments and blank lines
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return None;
     }
 
-    // Extract inode: leading hex chars
     let ino_end = trimmed
         .find(|c: char| !c.is_ascii_hexdigit())
         .unwrap_or(trimmed.len());
     if ino_end == 0 {
         return None;
     }
-    let ino = &trimmed[..ino_end];
-
+    let inode = trimmed[..ino_end].to_string();
     let rest = trimmed[ino_end..].trim();
 
     if rest.is_empty() {
-        // Delete command: only inode
-        return Some(ParsedLine::Delete(ino.to_string()));
+        return Some((inode, Command::Delete));
     }
 
-    // Parse: mode user group datetime filename
-    let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
-    let mode = parts.next()?.trim();
-    let rest = parts.next()?.trim();
+    let (mode_str, rest) = split_first_word(rest)?;
+    let (user, rest) = split_first_word(rest)?;
+    let (group, rest) = split_first_word(rest)?;
 
-    let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
-    let user = parts.next()?.trim();
-    let rest = parts.next()?.trim();
-
-    let mut parts = rest.splitn(2, |c: char| c.is_whitespace());
-    let group = parts.next()?.trim();
-    let rest = parts.next()?.trim();
-
-    // datetime is exactly 25 chars: YYYY-MM-DDTHH:MM:SS+HH:MM
     if rest.len() < 25 {
         return None;
     }
@@ -579,19 +444,33 @@ fn parse_line(line: &str) -> Option<ParsedLine> {
         return None;
     }
 
-    // Validate mode is numeric
-    if !mode.chars().all(|c| c.is_ascii_digit()) {
+    if !mode_str.chars().all(|c| c.is_ascii_digit()) {
         return None;
     }
 
-    Some(ParsedLine::Update {
-        ino: ino.to_string(),
-        mode: mode.to_string(),
-        user: user.to_string(),
-        group: group.to_string(),
-        datetime: datetime.to_string(),
-        filename: filename.to_string(),
-    })
+    let mode = u32::from_str_radix(mode_str, 8).ok()?;
+    let mtime = parse_datetime(datetime)?;
+
+    Some((
+        inode,
+        Command::Update {
+            mode,
+            user: user.to_string(),
+            group: group.to_string(),
+            datetime: datetime.to_string(),
+            mtime,
+            filename: filename.to_string(),
+        },
+    ))
+}
+
+fn split_first_word(s: &str) -> Option<(&str, &str)> {
+    let s = s.trim_start();
+    let end = s.find(|c: char| c.is_whitespace()).unwrap_or(s.len());
+    if end == 0 {
+        return None;
+    }
+    Some((&s[..end], s[end..].trim_start()))
 }
 
 // --- CLI ---
@@ -627,9 +506,8 @@ fn parse_args() -> Options {
     };
 
     let args: Vec<String> = env::args().skip(1).collect();
-    let mut i = 0;
-    while i < args.len() {
-        match args[i].as_str() {
+    for arg in &args {
+        match arg.as_str() {
             "-h" | "--help" => {
                 print_usage();
                 process::exit(0);
@@ -638,20 +516,19 @@ fn parse_args() -> Options {
             "-p" | "--non-interactive" => opts.interactive = false,
             "-r" | "--recursive" => opts.recursive = true,
             "-v" | "--verbose" => opts.verbose = true,
-            arg if arg.starts_with('-') => {
-                eprintln!("diredit: invalid option: {}", arg);
+            s if s.starts_with('-') => {
+                eprintln!("diredit: invalid option: {s}");
                 print_usage();
                 process::exit(1);
             }
             path => opts.paths.push(path.to_string()),
         }
-        i += 1;
     }
 
     if opts.paths.is_empty() {
         opts.paths.push(".".to_string());
         if has_stdin {
-            opts.recursive = true; // simplifies use in pipeline
+            opts.recursive = true;
         }
     }
 
@@ -665,46 +542,36 @@ const HELP_TEXT: &str = "\
 ## To delete a file remove everything on the line except the first column.
 ";
 
-fn main() {
+fn run() -> Result<(), String> {
     let opts = parse_args();
-    let dirs = Directories::list(&opts.paths, opts.recursive, opts.verbose, opts.interactive);
+    let show_paths = opts.verbose || opts.interactive;
+    let dirs = Directories::list(&opts.paths, opts.recursive, show_paths);
 
     if opts.interactive {
-        // Write to temp file, launch editor, read back
-        let tmp_dir = env::temp_dir();
-        let tmp_path = tmp_dir.join(format!("diredit-{}.diredit", process::id()));
+        let tmp_path = env::temp_dir().join(format!("diredit-{}.diredit", process::id()));
 
-        let content = format!("{}\n{}", dirs.to_string_repr(), HELP_TEXT);
-        if let Err(e) = fs::write(&tmp_path, &content) {
-            eprintln!("diredit: failed to write temp file: {}", e);
-            process::exit(1);
-        }
+        let content = format!("{dirs}\n{HELP_TEXT}");
+        fs::write(&tmp_path, &content)
+            .map_err(|e| format!("failed to write temp file: {e}"))?;
 
         let editor = env::var("EDITOR").unwrap_or_else(|_| "/usr/bin/vi".to_string());
-        let status = process::Command::new(&editor).arg(&tmp_path).status();
+        let status = process::Command::new(&editor)
+            .arg(&tmp_path)
+            .status()
+            .map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                format!("failed to launch editor '{editor}': {e}")
+            })?;
 
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => {
-                let _ = fs::remove_file(&tmp_path);
-                eprintln!("diredit: editor exited with status {}", s);
-                process::exit(1);
-            }
-            Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
-                eprintln!("diredit: failed to launch editor '{}': {}", editor, e);
-                process::exit(1);
-            }
+        if !status.success() {
+            let _ = fs::remove_file(&tmp_path);
+            return Err(format!("editor exited with status {status}"));
         }
 
-        let edited = match fs::read_to_string(&tmp_path) {
-            Ok(s) => s,
-            Err(e) => {
-                let _ = fs::remove_file(&tmp_path);
-                eprintln!("diredit: failed to read temp file: {}", e);
-                process::exit(1);
-            }
-        };
+        let edited = fs::read_to_string(&tmp_path).map_err(|e| {
+            let _ = fs::remove_file(&tmp_path);
+            format!("failed to read temp file: {e}")
+        })?;
 
         let _ = fs::remove_file(&tmp_path);
 
@@ -712,14 +579,21 @@ fn main() {
         let mut commands = parse_commands(&lines);
         dirs.apply(&mut commands, opts.verbose);
     } else if opts.has_stdin {
-        // Pipeline input mode
         let stdin = io::stdin();
         let lines: Vec<String> = stdin.lock().lines().filter_map(|l| l.ok()).collect();
         let mut commands = parse_commands(&lines);
         dirs.apply(&mut commands, opts.verbose);
     } else {
-        // Print mode
-        println!("{}", dirs.to_string_repr());
+        println!("{dirs}");
+    }
+
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        eprintln!("diredit: {e}");
+        process::exit(1);
     }
 }
 
@@ -746,7 +620,7 @@ mod tests {
         let lines = vec!["abc123".to_string()];
         let parsed = parse_commands(&lines);
         assert!(parsed.contains_key("abc123"));
-        assert_eq!(parsed["abc123"].inode(), "abc123");
+        assert!(matches!(parsed["abc123"], Command::Delete { .. }));
     }
 
     #[test]
@@ -756,6 +630,24 @@ mod tests {
         ];
         let parsed = parse_commands(&lines);
         assert!(parsed.contains_key("abc123"));
+        assert!(matches!(parsed["abc123"], Command::Update { .. }));
+    }
+
+    #[test]
+    fn parses_update_command_fields() {
+        let lines = vec![
+            "abc123 100644 user group 2014-04-30T10:11:12+01:00 /tmp/example.txt".to_string(),
+        ];
+        let parsed = parse_commands(&lines);
+        match &parsed["abc123"] {
+            Command::Update { mode, user, group, filename, .. } => {
+                assert_eq!(*mode, 0o100644);
+                assert_eq!(user, "user");
+                assert_eq!(group, "group");
+                assert_eq!(filename, "/tmp/example.txt");
+            }
+            _ => panic!("expected Update command"),
+        }
     }
 
     #[test]
@@ -766,46 +658,49 @@ mod tests {
         ];
         let parsed = parse_commands(&lines);
         assert!(parsed.contains_key("abc123"));
+        match &parsed["abc123"] {
+            Command::Update { user, group, filename, .. } => {
+                assert_eq!(user, "user");
+                assert_eq!(group, "group");
+                assert_eq!(filename, "/tmp/example.txt");
+            }
+            _ => panic!("expected Update command"),
+        }
     }
 
     #[test]
     fn parse_datetime_roundtrip() {
         let dt = "2014-04-30T10:11:12+01:00";
-        let parsed = parse_datetime(dt);
-        assert!(parsed.is_some());
+        assert!(parse_datetime(dt).is_some());
     }
 
     #[test]
     fn parse_datetime_negative_offset() {
         let dt = "2014-04-30T10:11:12-05:00";
-        let parsed = parse_datetime(dt);
-        assert!(parsed.is_some());
+        assert!(parse_datetime(dt).is_some());
     }
 
     #[test]
     fn file_list_produces_parseable_output() {
-        // Create a temp directory, list it, then parse the output back
-        let tmp = std::env::temp_dir().join("diredit-test-roundtrip");
+        let tmp = env::temp_dir().join("diredit-test-roundtrip");
         let _ = fs::create_dir_all(&tmp);
         let test_file = tmp.join("testfile.txt");
         fs::write(&test_file, "hello").unwrap();
 
         let fl = FileList::list(tmp.to_str().unwrap(), false).unwrap();
-        let output = fl.to_string_repr();
+        let output = fl.to_string();
         let lines: Vec<String> = output.lines().map(String::from).collect();
         let commands = parse_commands(&lines);
 
-        // Should have parsed at least our test file
         assert!(!commands.is_empty());
 
-        // Cleanup
         let _ = fs::remove_file(&test_file);
         let _ = fs::remove_dir(&tmp);
     }
 
     #[test]
     fn directories_to_string_with_verbose() {
-        let tmp = std::env::temp_dir().join("diredit-test-verbose");
+        let tmp = env::temp_dir().join("diredit-test-verbose");
         let _ = fs::create_dir_all(&tmp);
         let test_file = tmp.join("vtest.txt");
         fs::write(&test_file, "data").unwrap();
@@ -813,10 +708,9 @@ mod tests {
         let dirs = Directories::list(
             &[tmp.to_str().unwrap().to_string()],
             false,
-            true,  // verbose
-            false, // not interactive
+            true, // show_paths
         );
-        let output = dirs.to_string_repr();
+        let output = dirs.to_string();
         assert!(output.contains("# Path:"));
 
         let _ = fs::remove_file(&test_file);
