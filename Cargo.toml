@@ -1,0 +1,8 @@
+[package]
+name = "diredit"
+version = "0.1.0"
+edition = "2024"
+description = "Edit directory contents using your text editor or in a unix pipeline"
+
+[dependencies]
+libc = "0.2"
